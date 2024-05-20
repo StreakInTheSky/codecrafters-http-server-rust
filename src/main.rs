@@ -1,6 +1,7 @@
 use std::io::prelude::*;
 use std::net::{TcpListener, TcpStream};
 use std::io::BufReader;
+use std::thread;
 
 const STATUS_200: &str = "HTTP/1.1 200 OK";
 const STATUS_404: &str = "HTTP/1.1 404 Not Found";
@@ -42,26 +43,28 @@ fn main() {
      println!("Listening on port 4221");
 
      for stream in listener.incoming() {
-         match stream {
-             Ok(mut stream) => {
-                 let mut buffer = BufReader::new(&mut stream);
-                 let mut req_line_string = String::new();
-                 let _ = buffer.read_line(&mut req_line_string).unwrap();
-                 let url = get_request_url(&req_line_string);
-                 let url_parts: Vec<&str> = url.split_terminator('/').collect();
+         thread::spawn(|| {
+             match stream {
+                 Ok(mut stream) => {
+                     let mut buffer = BufReader::new(&mut stream);
+                     let mut req_line_string = String::new();
+                     let _ = buffer.read_line(&mut req_line_string).unwrap();
+                     let url = get_request_url(&req_line_string);
+                     let url_parts: Vec<&str> = url.split_terminator('/').collect();
 
-                 let response = match url_parts[..] {
-                     [""] => STATUS_200.to_string() + "\r\n\r\n",
-                     ["", "echo", endpoint] => echo(endpoint),
-                     ["", "user-agent"] => get_user_agent(&mut buffer),
-                     _ => STATUS_404.to_string() + "\r\n\r\n",
-                 };
+                     let response = match url_parts[..] {
+                         [""] => STATUS_200.to_string() + "\r\n\r\n",
+                         ["", "echo", endpoint] => echo(endpoint),
+                         ["", "user-agent"] => get_user_agent(&mut buffer),
+                         _ => STATUS_404.to_string() + "\r\n\r\n",
+                     };
 
-                 let _ = stream.write(response.as_bytes());
+                     let _ = stream.write(response.as_bytes());
+                 }
+                 Err(e) => {
+                     println!("error: {}", e);
+                 }
              }
-             Err(e) => {
-                 println!("error: {}", e);
-             }
-         }
+         });
      }
 }
