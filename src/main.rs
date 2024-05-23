@@ -44,8 +44,9 @@ fn parse_headers(buffer: &mut BufReader<&mut TcpStream>) -> HashMap<String, Stri
 
 fn echo(req_headers: HashMap<String, String>, endpoint: &str) -> String {
     let mut headers = format!("Content-Type: text/plain\r\nContent-Length: {}\r\n", endpoint.len());
-    if let Some(req_encoding) = req_headers.get("accept-encoding") {
-        if VALID_ENCODINGS.contains(&req_encoding.as_str()) {
+    if let Some(req_encodings) = req_headers.get("accept-encoding") {
+        let mut req_encodings_list = req_encodings.split(", ");
+        if let Some(req_encoding) = req_encodings_list.find(|encoding| VALID_ENCODINGS.contains(encoding)) {
             headers = headers + "Content-Encoding: " + req_encoding + "\r\n";
         }
     }
