@@ -8,6 +8,7 @@ use std::fs;
 const STATUS_200: &str = "HTTP/1.1 200 OK";
 const STATUS_201: &str = "HTTP/1.1 201 Created";
 const STATUS_404: &str = "HTTP/1.1 404 Not Found";
+const VALID_ENCODINGS: [&str; 1] = ["gzip"];
 
 enum Method {
     Get,
@@ -32,7 +33,7 @@ fn parse_headers(buffer: &mut BufReader<&mut TcpStream>) -> HashMap<String, Stri
     let mut headers = HashMap::new();
     while let Some(Ok(header_string)) = buf_iter.next() {
         if let Some(header_k_v) = header_string.split_once(": ") {
-            headers.insert(String::new() + header_k_v.0, String::new() + header_k_v.1);
+            headers.insert(header_k_v.0.to_lowercase(), header_k_v.1.to_lowercase());
         } else {
             break;
         }
@@ -41,14 +42,19 @@ fn parse_headers(buffer: &mut BufReader<&mut TcpStream>) -> HashMap<String, Stri
     headers
 }
 
-fn echo(endpoint: &str) -> String {
-    let headers = format!("Content-Type: text/plain\r\nContent-Length: {}\r\n", endpoint.len());
+fn echo(req_headers: HashMap<String, String>, endpoint: &str) -> String {
+    let mut headers = format!("Content-Type: text/plain\r\nContent-Length: {}\r\n", endpoint.len());
+    if let Some(req_encoding) = req_headers.get("accept-encoding") {
+        if VALID_ENCODINGS.contains(&req_encoding.as_str()) {
+            headers = headers + "Content-Encoding: " + req_encoding + "\r\n";
+        }
+    }
     let response = [STATUS_200, &headers, endpoint];
     response.join("\r\n")
 }
 
 fn get_user_agent(req_headers: HashMap<String, String>) -> String {
-    let user_agent = req_headers.get("User-Agent").unwrap();
+    let user_agent = req_headers.get("user-agent").unwrap();
 
     let headers = format!("Content-Type: text/plain\r\nContent-Length: {}\r\n", user_agent.len());
     let response = [STATUS_200, &headers, user_agent];
@@ -56,11 +62,9 @@ fn get_user_agent(req_headers: HashMap<String, String>) -> String {
 }
 
 fn get_body(headers: HashMap<String, String>, buffer: &mut BufReader<&mut TcpStream>) -> Vec<u8> {
-    let content_length = headers.get("Content-Length").unwrap_or(&"0".to_string()).parse::<usize>().unwrap();
-    println!("{}", content_length);
+    let content_length = headers.get("content-length").unwrap_or(&"0".to_string()).parse::<usize>().unwrap();
     let mut body = vec![0; content_length];
     
-    println!("body {}", body.len());
     buffer.read_exact(&mut body).unwrap_or_default();
 
     body
@@ -96,7 +100,7 @@ fn get_dir(mut args: std::env::Args) -> String {
 fn get(url_parts: Vec<&str>, headers: HashMap<String, String>, _buffer: BufReader<&mut TcpStream>) -> String {
     match url_parts[..] {
         [""] => STATUS_200.to_string() + "\r\n\r\n",
-        ["", "echo", endpoint] => echo(endpoint),
+        ["", "echo", endpoint] => echo(headers, endpoint),
         ["", "user-agent"] => get_user_agent(headers),
         ["", "files", filename] => match get_file(filename, &get_dir(std::env::args())) {
             Ok(response) => response,
