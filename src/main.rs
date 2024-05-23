@@ -4,11 +4,12 @@ use std::net::{TcpListener, TcpStream};
 use std::io::BufReader;
 use std::thread;
 use std::fs;
+use flate2::Compression;
+use flate2::write::GzEncoder;
 
 const STATUS_200: &str = "HTTP/1.1 200 OK";
 const STATUS_201: &str = "HTTP/1.1 201 Created";
 const STATUS_404: &str = "HTTP/1.1 404 Not Found";
-const VALID_ENCODINGS: [&str; 1] = ["gzip"];
 
 enum Method {
     Get,
@@ -42,16 +43,29 @@ fn parse_headers(buffer: &mut BufReader<&mut TcpStream>) -> HashMap<String, Stri
     headers
 }
 
-fn echo(req_headers: HashMap<String, String>, endpoint: &str) -> String {
-    let mut headers = format!("Content-Type: text/plain\r\nContent-Length: {}\r\n", endpoint.len());
-    if let Some(req_encodings) = req_headers.get("accept-encoding") {
+fn echo(req_headers: HashMap<String, String>, endpoint: &str, encoders: &[&str]) -> Vec<u8> {
+    let mut headers: HashMap<&str, &str> = HashMap::new();
+    headers.insert("Content-Type", "text/plain");
+    let content = if let Some(req_encodings) = req_headers.get("accept-encoding") {
         let mut req_encodings_list = req_encodings.split(", ");
-        if let Some(req_encoding) = req_encodings_list.find(|encoding| VALID_ENCODINGS.contains(encoding)) {
-            headers = headers + "Content-Encoding: " + req_encoding + "\r\n";
+        if let Some(req_encoding) = req_encodings_list.find(|encoding| encoders.contains(encoding)) {
+            headers.insert("Content-Encoding",  req_encoding);
+            let mut e = GzEncoder::new(Vec::new(), Compression::default());
+            let _ = e.write_all(endpoint.as_bytes());
+            e.finish().unwrap()
+        } else {
+            endpoint.as_bytes().to_vec()
         }
-    }
-    let response = [STATUS_200, &headers, endpoint];
-    response.join("\r\n")
+    } else {
+        endpoint.as_bytes().to_vec()
+    };
+
+    let content_length = content.len().to_string();
+    headers.insert("Content-Length", &content_length);
+    let headers = headers.iter().map(|(k, v)| format!("{}: {}\r\n", k, v)).collect::<Vec<String>>().join("");
+    let mut response = [STATUS_200, &headers, ""].join("\r\n").into_bytes();
+    response.extend(&content);
+    response
 }
 
 fn get_user_agent(req_headers: HashMap<String, String>) -> String {
@@ -98,16 +112,16 @@ fn get_dir(mut args: std::env::Args) -> String {
     String::from("/")
 }
 
-fn get(url_parts: Vec<&str>, headers: HashMap<String, String>, _buffer: BufReader<&mut TcpStream>) -> String {
+fn get(url_parts: Vec<&str>, headers: HashMap<String, String>, _buffer: BufReader<&mut TcpStream>, encoders: &[&str]) -> Vec<u8> {
     match url_parts[..] {
-        [""] => STATUS_200.to_string() + "\r\n\r\n",
-        ["", "echo", endpoint] => echo(headers, endpoint),
-        ["", "user-agent"] => get_user_agent(headers),
+        [""] => (STATUS_200.to_string() + "\r\n\r\n").as_bytes().to_vec(),
+        ["", "echo", endpoint] => echo(headers, endpoint, encoders),
+        ["", "user-agent"] => get_user_agent(headers).as_bytes().to_vec(),
         ["", "files", filename] => match get_file(filename, &get_dir(std::env::args())) {
-            Ok(response) => response,
-            _ => STATUS_404.to_string() + "\r\n\r\n",
+            Ok(response) => response.as_bytes().to_vec(),
+            _ => (STATUS_404.to_string() + "\r\n\r\n").as_bytes().to_vec(),
         },
-        _ => STATUS_404.to_string() + "\r\n\r\n",
+        _ => (STATUS_404.to_string() + "\r\n\r\n").as_bytes().to_vec(),
     }
 }
 
@@ -126,16 +140,17 @@ fn main() {
         thread::spawn(move|| {
             match stream {
                 Ok(mut stream) => {
+                    let available_encoders = vec!["gzip"];
                     let mut buffer = BufReader::new(&mut stream);
                     let (method, url) = parse_request(&mut buffer);
                     let headers = parse_headers(&mut buffer);
                     let url_parts: Vec<&str> = url.split_terminator('/').collect();
                     let response = match method {
-                        Method::Get => get(url_parts, headers, buffer),
-                        Method::Post => post(url_parts, headers, buffer)
+                        Method::Get => get(url_parts, headers, buffer, &available_encoders),
+                        Method::Post => post(url_parts, headers, buffer).as_bytes().to_vec()
                     };
 
-                    let _ = stream.write(response.as_bytes());
+                    let _ = stream.write(&response);
                 }
                 Err(e) => {
                     println!("error: {}", e);
