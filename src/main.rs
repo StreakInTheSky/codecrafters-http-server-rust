@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::prelude::*;
 use std::net::{TcpListener, TcpStream};
 use std::io::BufReader;
@@ -13,15 +14,31 @@ enum Method {
     Post,
 }
 
-fn get_request(request_string: &str) -> (Method, &str) {
-    let request_headers: Vec<&str> = request_string.split(' ').collect();
+fn parse_request(buffer: &mut BufReader<&mut TcpStream>) -> (Method, String) {
+    let mut req_line_string = String::new();
+    let _ = buffer.read_line(&mut req_line_string).unwrap();
+    let request_headers: Vec<&str> = req_line_string.split(' ').collect();
 
     let method = match request_headers[0] {
         "GET" => Method::Get,
         "POST" => Method::Post,
         _ => panic!()
     };
-    (method, request_headers[1])
+    (method, request_headers[1].to_string())
+}
+
+fn parse_headers(buffer: &mut BufReader<&mut TcpStream>) -> HashMap<String, String> {
+    let mut buf_iter = buffer.lines();
+    let mut headers = HashMap::new();
+    while let Some(Ok(header_string)) = buf_iter.next() {
+        if let Some(header_k_v) = header_string.split_once(": ") {
+            headers.insert(String::new() + header_k_v.0, String::new() + header_k_v.1);
+        } else {
+            break;
+        }
+    }
+
+    headers
 }
 
 fn echo(endpoint: &str) -> String {
@@ -30,28 +47,22 @@ fn echo(endpoint: &str) -> String {
     response.join("\r\n")
 }
 
-fn get_user_agent(buffer: &mut BufReader<&mut TcpStream>) -> String {
-    let mut buf_iter = buffer.lines();
-    let mut user_agent = String::new();
-    while let Some(Ok(header_string)) = buf_iter.next() {
-        if header_string == "\r\n" {
-            // could not find user agent header
-            break;
-        }
-        let header_k_v = header_string.split_once(": ").unwrap();
-        if header_k_v.0 == "User-Agent" {
-            user_agent = String::new() + header_k_v.1;
-        }
-    }
+fn get_user_agent(req_headers: HashMap<String, String>) -> String {
+    let user_agent = req_headers.get("User-Agent").unwrap();
 
     let headers = format!("Content-Type: text/plain\r\nContent-Length: {}\r\n", user_agent.len());
-    let response = [STATUS_200, &headers, &user_agent];
+    let response = [STATUS_200, &headers, user_agent];
     response.join("\r\n")
 }
 
-fn get_body(mut buffer: BufReader<&mut TcpStream>) -> String {
-    let mut body = String::new();
-    let _ = buffer.read_to_string(&mut body);
+fn get_body(headers: HashMap<String, String>, buffer: &mut BufReader<&mut TcpStream>) -> Vec<u8> {
+    let content_length = headers.get("Content-Length").unwrap_or(&"0".to_string()).parse::<usize>().unwrap();
+    println!("{}", content_length);
+    let mut body = vec![0; content_length];
+    
+    println!("body {}", body.len());
+    buffer.read_exact(&mut body).unwrap_or_default();
+
     body
 }
 
@@ -63,10 +74,10 @@ fn get_file(filename: &str, dir: &str) -> std::io::Result<String> {
     Ok(response.join("\r\n"))
 }
 
-fn save_file(filename: &str, dir: &str, contents: &str) -> String {
+fn save_file(filename: &str, dir: &str, contents: &Vec<u8>) -> String {
     let filepath = String::new() + dir + "/" + filename;
     let _ = fs::write(filepath, contents);
-    String::new() + STATUS_201 + "\r\n"
+    String::new() + STATUS_201 + "\r\n\r\n"
 }
 
 fn get_dir(mut args: std::env::Args) -> String {
@@ -82,11 +93,11 @@ fn get_dir(mut args: std::env::Args) -> String {
     String::from("/")
 }
 
-fn get(url_parts: Vec<&str>, mut buffer: BufReader<&mut TcpStream>) -> String {
+fn get(url_parts: Vec<&str>, headers: HashMap<String, String>, _buffer: BufReader<&mut TcpStream>) -> String {
     match url_parts[..] {
         [""] => STATUS_200.to_string() + "\r\n\r\n",
         ["", "echo", endpoint] => echo(endpoint),
-        ["", "user-agent"] => get_user_agent(&mut buffer),
+        ["", "user-agent"] => get_user_agent(headers),
         ["", "files", filename] => match get_file(filename, &get_dir(std::env::args())) {
             Ok(response) => response,
             _ => STATUS_404.to_string() + "\r\n\r\n",
@@ -95,15 +106,12 @@ fn get(url_parts: Vec<&str>, mut buffer: BufReader<&mut TcpStream>) -> String {
     }
 }
 
-fn post(url_parts: Vec<&str>, buffer: BufReader<&mut TcpStream>) -> String {
+fn post(url_parts: Vec<&str>, headers: HashMap<String, String>, mut buffer: BufReader<&mut TcpStream>) -> String {
     match url_parts[..] {
-        ["", "files", filename] => save_file(filename, &get_dir(std::env::args()), &get_body(buffer)),
+        ["", "files", filename] => save_file(filename, &get_dir(std::env::args()), &get_body(headers, &mut buffer)),
         _ => STATUS_404.to_string() + "\r\n\r\n",
     }
 }
-
-
-
 
 fn main() {
     let listener = TcpListener::bind("127.0.0.1:4221").unwrap();
@@ -114,13 +122,12 @@ fn main() {
             match stream {
                 Ok(mut stream) => {
                     let mut buffer = BufReader::new(&mut stream);
-                    let mut req_line_string = String::new();
-                    let _ = buffer.read_line(&mut req_line_string).unwrap();
-                    let (method, url) = get_request(&req_line_string);
+                    let (method, url) = parse_request(&mut buffer);
+                    let headers = parse_headers(&mut buffer);
                     let url_parts: Vec<&str> = url.split_terminator('/').collect();
                     let response = match method {
-                        Method::Get => get(url_parts, buffer),
-                        Method::Post => post(url_parts, buffer)
+                        Method::Get => get(url_parts, headers, buffer),
+                        Method::Post => post(url_parts, headers, buffer)
                     };
 
                     let _ = stream.write(response.as_bytes());
