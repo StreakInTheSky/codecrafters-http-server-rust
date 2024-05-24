@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::io::prelude::*;
 use std::net::{TcpListener, TcpStream};
 use std::io::BufReader;
-use std::thread;
+use std::{thread, u8};
 use std::fs;
 use flate2::Compression;
 use flate2::write::GzEncoder;
@@ -16,67 +16,169 @@ enum Method {
     Post,
 }
 
-fn parse_request(buffer: &mut BufReader<&mut TcpStream>) -> (Method, String) {
-    let mut req_line_string = String::new();
-    let _ = buffer.read_line(&mut req_line_string).unwrap();
-    let request_headers: Vec<&str> = req_line_string.split(' ').collect();
-
-    let method = match request_headers[0] {
-        "GET" => Method::Get,
-        "POST" => Method::Post,
-        _ => panic!()
-    };
-    (method, request_headers[1].to_string())
+enum Status {
+	OK,
+	Created,
+	NotFound
 }
 
-fn parse_headers(buffer: &mut BufReader<&mut TcpStream>) -> HashMap<String, String> {
-    let mut buf_iter = buffer.lines();
-    let mut headers = HashMap::new();
-    while let Some(Ok(header_string)) = buf_iter.next() {
-        if let Some(header_k_v) = header_string.split_once(": ") {
-            headers.insert(header_k_v.0.to_lowercase(), header_k_v.1.to_lowercase());
-        } else {
-            break;
-        }
-    }
-
-    headers
+enum Body {
+	Raw(Vec<u8>),
+	Compress(Vec<u8>)
 }
 
-fn echo(req_headers: HashMap<String, String>, endpoint: &str, encoders: &[&str]) -> Vec<u8> {
-    let mut headers: HashMap<&str, &str> = HashMap::new();
-    headers.insert("Content-Type", "text/plain");
-    let content = if let Some(req_encodings) = req_headers.get("accept-encoding") {
-        let mut req_encodings_list = req_encodings.split(", ");
-        if let Some(req_encoding) = req_encodings_list.find(|encoding| encoders.contains(encoding)) {
-            headers.insert("Content-Encoding",  req_encoding);
-            let mut e = GzEncoder::new(Vec::new(), Compression::default());
-            let _ = e.write_all(endpoint.as_bytes());
-            e.finish().unwrap()
-        } else {
-            endpoint.as_bytes().to_vec()
-        }
-    } else {
-        endpoint.as_bytes().to_vec()
-    };
-
-    let content_length = content.len().to_string();
-    headers.insert("Content-Length", &content_length);
-    let headers = headers.iter().map(|(k, v)| format!("{}: {}\r\n", k, v)).collect::<Vec<String>>().join("");
-    let mut response = [STATUS_200, &headers, ""].join("\r\n").into_bytes();
-    response.extend(&content);
-    response
+struct Request {
+	method: Method,
+	url: String,
+	headers: HashMap<String, String>,
 }
 
-fn get_user_agent(req_headers: HashMap<String, String>) -> String {
-    let user_agent = req_headers.get("user-agent").unwrap();
+impl Request {
+	fn new(buffer: &mut BufReader<&mut TcpStream>) -> Request {
+		let (method, url) = Request::parse_request(buffer);
+		let headers = Request::parse_headers(buffer);
 
-    let headers = format!("Content-Type: text/plain\r\nContent-Length: {}\r\n", user_agent.len());
-    let response = [STATUS_200, &headers, user_agent];
-    response.join("\r\n")
+		Request{method, url, headers}
+	}
+
+	fn parse_request(buffer: &mut BufReader<&mut TcpStream>) -> (Method, String) {
+		let mut req_line_string = String::new();
+		let _ = buffer.read_line(&mut req_line_string).unwrap();
+		let request_headers: Vec<&str> = req_line_string.split(' ').collect();
+
+		let method = match request_headers[0] {
+			"GET" => Method::Get,
+			"POST" => Method::Post,
+			_ => panic!()
+		};
+		(method, request_headers[1].to_string())
+	}
+
+	fn parse_headers(buffer: &mut BufReader<&mut TcpStream>) -> HashMap<String, String> {
+		let mut buf_iter = buffer.lines();
+		let mut headers = HashMap::new();
+		while let Some(Ok(header_string)) = buf_iter.next() {
+			if let Some(header_k_v) = header_string.split_once(": ") {
+				headers.insert(header_k_v.0.to_lowercase(), header_k_v.1.to_lowercase());
+			} else {
+				break;
+			}
+		}
+
+		let available_encoders = ["gzip"];
+		if let Some(req_encodings) = headers.get("accept-encoding") {
+			let mut req_encodings_list = req_encodings.split(", ");
+			if let Some(req_encoding) = req_encodings_list.find(|encoding| available_encoders.contains(encoding)) {
+				headers.insert("accept-encoding".to_string(), req_encoding.to_string());
+			} else {
+				headers.remove("accept-encoding");
+			}
+		}
+
+		headers
+	}
+
 }
 
-fn get_body(headers: HashMap<String, String>, buffer: &mut BufReader<&mut TcpStream>) -> Vec<u8> {
+struct Response {
+	status: Status,
+	headers: HashMap<String, String>,
+    body: Body
+}
+
+impl Response {
+	fn new(status: Status, content_type: &str, content: Vec<u8>, encoder: Option<&String>) -> Response {
+		let mut headers = HashMap::new();
+		headers.insert("Content-Type".to_string(), content_type.to_string());
+		let body = if let Some(encoder) = encoder {
+			headers.insert("Content-Encoding".to_string(), encoder.to_string());
+			Body::Compress(content)
+		} else {
+			Body::Raw(content)
+		};
+
+		Response{status, headers, body}
+	}
+
+	fn not_found() -> Response {
+		let status = Status::NotFound;
+		let headers = HashMap::new();
+        let body = Body::Raw(Vec::new());
+		Response{status, headers, body}
+	}
+
+	fn ok() -> Response {
+		let status = Status::OK;
+		let headers = HashMap::new();
+        let body = Body::Raw(Vec::new());
+		Response{status, headers, body}
+	}
+
+	fn created() -> Response {
+		let status = Status::Created;
+		let headers = HashMap::new();
+        let body = Body::Raw(Vec::new());
+		Response{status, headers, body}
+	}
+
+	fn to_bytes_mut(&mut self) -> std::io::Result<Vec<u8>> {
+		let status = match self.status {
+			Status::OK => STATUS_200,
+			Status::Created => STATUS_201,
+			Status::NotFound => STATUS_404
+		};
+		let mut content: Vec<u8> = Vec::new();
+		let content_length = match &self.body {
+			Body::Raw(body) => {
+				content.extend(body.iter());
+				body.len()
+			},
+			Body::Compress(body) => {
+				let compressed = compress(body)?;
+				content.extend(&compressed);
+				compressed.len()
+			}
+		};
+
+		self.headers.insert("Content-Length".to_string(), content_length.to_string());
+		let headers = self.headers.iter().map(|(k, v)| format!("{}: {}\r\n", k, v)).collect::<Vec<String>>().join("");
+		let mut response = [status, &headers, ""].join("\r\n").into_bytes();
+		response.extend(content);
+		Ok(response)
+	}
+}
+
+fn compress(body: &[u8]) -> std::io::Result<Vec<u8>> {
+	let mut e = GzEncoder::new(Vec::new(), Compression::default());
+	let _ = e.write_all(body);
+	e.finish()
+}
+
+fn echo(req_headers: HashMap<String, String>, endpoint: &str) -> Vec<u8> {
+	let mut response = Response::new(Status::OK, "text/plain", endpoint.to_string().into_bytes(), req_headers.get("accept-encoding"));
+	response.to_bytes_mut().unwrap()
+}
+
+fn get_user_agent(req_headers: HashMap<String, String>) -> Vec<u8> {
+	let user_agent = req_headers.get("user-agent").unwrap();
+	let mut response = Response::new(Status::OK, "text/plain", user_agent.to_owned().into_bytes(), None);
+	response.to_bytes_mut().unwrap()
+}
+
+fn get_file(req_headers: HashMap<String, String>, filename: &str, dir: &str) -> std::io::Result<Vec<u8>> {
+    let filepath = String::new() + dir + "/" + filename;
+    let file = fs::read(filepath)?;
+	let mut response = Response::new(Status::OK, "application/octet-stream", file, req_headers.get("accept-encoding"));
+    response.to_bytes_mut()
+}
+
+fn save_file(filename: &str, dir: &str, contents: &Vec<u8>) -> Vec<u8> {
+    let filepath = String::new() + dir + "/" + filename;
+    let _ = fs::write(filepath, contents);
+	Response::created().to_bytes_mut().unwrap()
+}
+
+fn parse_body(headers: HashMap<String, String>, buffer: &mut BufReader<&mut TcpStream>) -> Vec<u8> {
     let content_length = headers.get("content-length").unwrap_or(&"0".to_string()).parse::<usize>().unwrap();
     let mut body = vec![0; content_length];
     
@@ -85,21 +187,7 @@ fn get_body(headers: HashMap<String, String>, buffer: &mut BufReader<&mut TcpStr
     body
 }
 
-fn get_file(filename: &str, dir: &str) -> std::io::Result<String> {
-    let filepath = String::new() + dir + "/" + filename;
-    let file = fs::read(filepath)?;
-    let headers = format!("Content-Type: application/octet-stream\r\nContent-Length: {}\r\n", file.len());
-    let response = [STATUS_200, &headers, &String::from_utf8(file).unwrap()];
-    Ok(response.join("\r\n"))
-}
-
-fn save_file(filename: &str, dir: &str, contents: &Vec<u8>) -> String {
-    let filepath = String::new() + dir + "/" + filename;
-    let _ = fs::write(filepath, contents);
-    String::new() + STATUS_201 + "\r\n\r\n"
-}
-
-fn get_dir(mut args: std::env::Args) -> String {
+fn parse_dir(mut args: std::env::Args) -> String {
     for arg in args.by_ref()  {
         if arg == "--directory"{
             break;
@@ -112,23 +200,25 @@ fn get_dir(mut args: std::env::Args) -> String {
     String::from("/")
 }
 
-fn get(url_parts: Vec<&str>, headers: HashMap<String, String>, _buffer: BufReader<&mut TcpStream>, encoders: &[&str]) -> Vec<u8> {
+fn get(req: Request, _buffer: BufReader<&mut TcpStream>) -> Vec<u8> {
+	let url_parts: Vec<&str> = req.url.split_terminator('/').collect();
     match url_parts[..] {
-        [""] => (STATUS_200.to_string() + "\r\n\r\n").as_bytes().to_vec(),
-        ["", "echo", endpoint] => echo(headers, endpoint, encoders),
-        ["", "user-agent"] => get_user_agent(headers).as_bytes().to_vec(),
-        ["", "files", filename] => match get_file(filename, &get_dir(std::env::args())) {
-            Ok(response) => response.as_bytes().to_vec(),
-            _ => (STATUS_404.to_string() + "\r\n\r\n").as_bytes().to_vec(),
+        [""] => Response::ok().to_bytes_mut().unwrap(),
+        ["", "echo", endpoint] => echo(req.headers, endpoint),
+        ["", "user-agent"] => get_user_agent(req.headers),
+        ["", "files", filename] => match get_file(req.headers, filename, &parse_dir(std::env::args())) {
+            Ok(response) => response,
+            _ => Response::not_found().to_bytes_mut().unwrap()
         },
-        _ => (STATUS_404.to_string() + "\r\n\r\n").as_bytes().to_vec(),
+        _ => Response::not_found().to_bytes_mut().unwrap()
     }
 }
 
-fn post(url_parts: Vec<&str>, headers: HashMap<String, String>, mut buffer: BufReader<&mut TcpStream>) -> String {
+fn post(req: Request, mut buffer: BufReader<&mut TcpStream>) -> Vec<u8> {
+	let url_parts: Vec<&str> = req.url.split_terminator('/').collect();
     match url_parts[..] {
-        ["", "files", filename] => save_file(filename, &get_dir(std::env::args()), &get_body(headers, &mut buffer)),
-        _ => STATUS_404.to_string() + "\r\n\r\n",
+        ["", "files", filename] => save_file(filename, &parse_dir(std::env::args()), &parse_body(req.headers, &mut buffer)),
+        _ => Response::not_found().to_bytes_mut().unwrap()
     }
 }
 
@@ -140,14 +230,12 @@ fn main() {
         thread::spawn(move|| {
             match stream {
                 Ok(mut stream) => {
-                    let available_encoders = vec!["gzip"];
                     let mut buffer = BufReader::new(&mut stream);
-                    let (method, url) = parse_request(&mut buffer);
-                    let headers = parse_headers(&mut buffer);
-                    let url_parts: Vec<&str> = url.split_terminator('/').collect();
-                    let response = match method {
-                        Method::Get => get(url_parts, headers, buffer, &available_encoders),
-                        Method::Post => post(url_parts, headers, buffer).as_bytes().to_vec()
+					let req = Request::new(&mut buffer);
+			
+                    let response = match req.method {
+                        Method::Get => get(req, buffer),
+                        Method::Post => post(req, buffer)
                     };
 
                     let _ = stream.write(&response);
